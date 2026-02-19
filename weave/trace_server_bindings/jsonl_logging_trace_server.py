@@ -71,7 +71,7 @@ def _capture_git_state(run_id: str) -> dict[str, Any]:
         # touching the working tree or the index permanently.
         # 1. Write a temporary index that includes all working-tree changes
         import tempfile, os as _os
-        tmp_index = tempfile.mktemp(prefix=".cdweave_idx_", dir=repo_root)
+        tmp_index = tempfile.mktemp(prefix=".cdweave_idx_", dir=_os.path.join(repo_root, ".git"))
         env = {**_os.environ, "GIT_INDEX_FILE": tmp_index}
         try:
             import subprocess
@@ -109,10 +109,11 @@ def _capture_git_state(run_id: str) -> dict[str, Any]:
         except Exception:
             snapshot_sha = None
         finally:
-            try:
-                _os.unlink(tmp_index)
-            except Exception:
-                pass
+            for f in (tmp_index, tmp_index + ".lock"):
+                try:
+                    _os.unlink(f)
+                except Exception:
+                    pass
 
     return {
         "git_repo_root": repo_root,
@@ -126,10 +127,13 @@ def _capture_git_state(run_id: str) -> dict[str, Any]:
 # Misc helpers
 # ---------------------------------------------------------------------------
 
-def _default_log_path() -> Path:
+def _default_log_path(project: str | None = None) -> Path:
+    import os
     ts = time.strftime("%Y%m%d_%H%M%S")
     uid = str(uuid.uuid4())[:8]
-    runs_dir = Path("runs")
+    # Sanitise project name for use as a directory name
+    safe_project = "".join(c if c.isalnum() or c in "-_." else "_" for c in (project or "default"))
+    runs_dir = Path(os.path.expanduser("~")) / ".cache" / "codeweave" / safe_project
     runs_dir.mkdir(parents=True, exist_ok=True)
     return runs_dir / f"{ts}_{uid}.jsonl"
 
@@ -211,7 +215,8 @@ def attach_jsonl_logger(
     Returns:
         The Path of the log file being written to.
     """
-    resolved_path = Path(log_path) if log_path else _default_log_path()
+    project = getattr(client, "project", None)
+    resolved_path = Path(log_path) if log_path else _default_log_path(project)
     resolved_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Derive run_id from the log filename

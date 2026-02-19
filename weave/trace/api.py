@@ -383,6 +383,17 @@ def thread(thread_id: str | None | object = _AUTO_GENERATE) -> Iterator[ThreadCo
         yield context
 
 
+def set_git_path(path: str) -> None:
+    """Set the directory (or file path) to use as the git root for code snapshotting.
+
+    Call this before weave.init() with the path to your script:
+        weave.set_git_path(os.path.dirname(os.path.abspath(__file__)))
+    """
+    from weave.trace_server_bindings.jsonl_logging_trace_server import set_git_path as _set
+    import os
+    _set(os.path.dirname(path) if os.path.isfile(path) else path)
+
+
 def finish() -> None:
     """Stops logging to weave.
 
@@ -413,6 +424,7 @@ __all__ = [
     "publish",
     "ref",
     "require_current_call",
+    "set_git_path",
     "set_view",
     "thread",
     "weave_client_context",

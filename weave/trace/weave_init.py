@@ -206,6 +206,12 @@ def init_weave(
         }
     )
 
+    try:
+        from weave.trace_server_bindings.jsonl_logging_trace_server import attach_jsonl_logger
+        attach_jsonl_logger(client)
+    except Exception:
+        pass
+
     return client
 
 

@@ -28,15 +28,12 @@ from weave.trace_server_bindings.models import CompleteBatchItem, EndBatchItem, 
 # Global git path override
 # ---------------------------------------------------------------------------
 
-_git_path_override: str | None = None
-
 def set_git_path(path: str) -> None:
-    """Set the directory to use as the git repo root for snapshotting.
-    Call this before attach_jsonl_logger:
-        weave_logger.set_git_path(os.path.dirname(__file__))
+    """Set the git repo directory for snapshotting. Takes priority over
+    the WEAVE_GIT_PATH environment variable. Can be called before or after weave.init().
     """
-    global _git_path_override
-    _git_path_override = path
+    import os as _os
+    _os.environ['WEAVE_GIT_PATH'] = path
 
 
 # ---------------------------------------------------------------------------
@@ -68,9 +65,9 @@ def _capture_git_state(run_id: str) -> dict[str, Any]:
         git_snapshot_sha  — full SHA of the snapshot commit (if dirty), else None
     """
     import os
-    if not _git_path_override:
+    cwd = os.environ.get('WEAVE_GIT_PATH')
+    if not cwd:
         return {"git_repo_root": None, "git_commit": None, "git_dirty": False, "git_snapshot_sha": None}
-    cwd = _git_path_override
 
     repo_root = _git(["rev-parse", "--show-toplevel"], cwd)
     if not repo_root:

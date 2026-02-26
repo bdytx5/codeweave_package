@@ -14,6 +14,7 @@ Usage:
 
 from __future__ import annotations
 
+import inspect
 import json
 import subprocess
 import time
@@ -22,6 +23,53 @@ from pathlib import Path
 from typing import Any
 
 from weave.trace_server_bindings.models import CompleteBatchItem, EndBatchItem, StartBatchItem
+
+# ---------------------------------------------------------------------------
+# Call-site cache: populated at call_start time (on the calling thread),
+# consumed at log time (on the batch-processor thread).
+# ---------------------------------------------------------------------------
+_callsite_cache: dict[str, dict[str, Any]] = {}
+
+# Modules/files to skip when walking the stack to find user code.
+_SKIP_PREFIXES = (
+    "weave",
+    "openai",
+    "httpx",
+    "anyio",
+    "asyncio",
+    "concurrent",
+    "threading",
+)
+
+
+def _capture_callsite() -> dict[str, Any]:
+    """Walk the current call stack and return the best user-code frame.
+
+    Prefers a named function over a bare <module> frame so that top-level
+    script calls (asyncio.run(main())) don't swallow the real call site.
+    """
+    best: dict[str, Any] | None = None
+    for frame_info in inspect.stack():
+        fname = frame_info.filename
+        parts = fname.replace("\\", "/").split("/")
+        skip = any(
+            any(part.startswith(p) for p in _SKIP_PREFIXES)
+            for part in parts
+        )
+        if skip or fname == "<string>" or fname.startswith("<"):
+            continue
+        candidate = {
+            "callsite_file": fname,
+            "callsite_line": frame_info.lineno,
+            "callsite_function": frame_info.function,
+        }
+        if frame_info.function != "<module>":
+            # Named function — best possible result, stop here
+            return candidate
+        if best is None:
+            # <module> frame — keep as fallback but keep looking
+            best = candidate
+    return best or {}
 
 
 # ---------------------------------------------------------------------------
@@ -194,18 +242,25 @@ def _source_for_op_name(op_name: str | None) -> dict[str, Any]:
     """Extract short name from op_name URI, find the matching live op, read its source attrs."""
     if not op_name:
         return {}
-    short = op_name.split("/")[-1].split(":")[0]
+    raw = op_name.split("/")[-1].split(":")[0]
+    # raw may be dotted like "openai.chat.completions.create" or "SupportAgentV1.predict"
+    # only the last segment is a valid Python identifier to look up on a module
+    short = raw.split(".")[-1]
     import sys
     for module in list(sys.modules.values()):
         try:
             obj = getattr(module, short, None)
         except Exception:
             continue
-        if obj is not None and getattr(obj, "_source_file", None) is not None:
+        try:
+            source_file = obj is not None and getattr(obj, "_source_file", None)
+        except Exception:
+            continue
+        if obj is not None and source_file:
             name = getattr(getattr(obj, "resolve_fn", obj), "__name__", short)
             return {
                 "function": name,
-                "source_file": obj._source_file,
+                "source_file": source_file,
                 "source_line_start": obj._source_line_start,
                 "source_line_end": obj._source_line_end,
             }
@@ -250,6 +305,21 @@ def attach_jsonl_logger(
     if proc is None:
         raise RuntimeError("No call_processor found on the remote server.")
 
+    # Patch client.create_call — runs entirely on the user thread, before
+    # send_start_call is deferred to the executor. This is the only point where
+    # the user's actual call stack is still available.
+    _orig_create_call = client.create_call
+
+    def _patched_create_call(*args: Any, **kw: Any) -> Any:
+        callsite = _capture_callsite()
+        call = _orig_create_call(*args, **kw)
+        call_id = getattr(call, "id", None)
+        if call_id and callsite:
+            _callsite_cache[call_id] = callsite
+        return call
+
+    client.create_call = _patched_create_call
+
     original_fn = proc.processor_fn
     _pending: dict[str, dict[str, Any]] = {}
 
@@ -278,6 +348,12 @@ def attach_jsonl_logger(
                 call = item.req
                 ts_start = _dt_to_ts(call.started_at)
                 ts_end = _dt_to_ts(call.ended_at)
+                callsite = _callsite_cache.pop(call.id, {})
+                source = _source_for_op_name(call.op_name)
+                # For monkey-patched ops (e.g. openai) source lookup finds nothing;
+                # fall back to the callsite captured at call_start time.
+                if not source:
+                    source = callsite
                 _append({
                     "call_id": call.id,
                     "op_name": call.op_name,
@@ -292,7 +368,7 @@ def attach_jsonl_logger(
                     "trace_id": call.trace_id,
                     "attributes": _safe_json(call.attributes),
                     "summary": _safe_json(dict(call.summary) if call.summary else {}),
-                    **_source_for_op_name(call.op_name),
+                    **source,
                 })
 
             elif isinstance(item, EndBatchItem):
@@ -301,6 +377,10 @@ def attach_jsonl_logger(
                 ts_start = pending.get("timestamp_start")
                 ts_end = _dt_to_ts(e.ended_at)
                 op_name = pending.get("op_name")
+                callsite = _callsite_cache.pop(e.id, {})
+                source = _source_for_op_name(op_name)
+                if not source:
+                    source = callsite
                 _append({
                     "call_id": e.id,
                     "op_name": op_name,
@@ -315,7 +395,7 @@ def attach_jsonl_logger(
                     "trace_id": pending.get("trace_id"),
                     "attributes": pending.get("attributes"),
                     "summary": _safe_json(dict(e.summary) if e.summary else {}),
-                    **_source_for_op_name(op_name),
+                    **source,
                 })
 
         original_fn(batch, **kwargs)
